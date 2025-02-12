@@ -6,6 +6,7 @@ import time
 from typing import Dict, List, Optional
 from datetime import datetime
 import urllib.parse
+import argparse  # Import argparse for command-line arguments
 
 # Load environment variables
 load_dotenv()
@@ -212,48 +213,38 @@ class GitHubAPI:
                 return []
 
 
-def process_contracts():
+def process_contracts(origin_key: str):
     """Main function to process contracts by origin_key."""
     try:
-        # Get list of origin keys
-        origin_keys = AirtableAPI.get_origin_keys()
-        print(f"Found {len(origin_keys)} origin keys: {', '.join(origin_keys)}")
+        # Fetch unprocessed records for the specified origin
+        records = AirtableAPI.fetch_contracts_by_origin(origin_key)
 
-        # Process each origin key
-        for origin_key in origin_keys:
-            print(f"\nProcessing origin key: {origin_key}")
+        if not records:
+            print(f"No unprocessed records for {origin_key}")
+            return
 
-            # Fetch unprocessed records for this origin
-            records = AirtableAPI.fetch_contracts_by_origin(origin_key)
+        # Process each record
+        for index, record in enumerate(records, 1):
+            record_id = record['id']
+            fields = record.get('fields', {})
+            contract_address = fields.get('address')
 
-            if not records:
-                print(f"No unprocessed records for {origin_key}")
+            if not contract_address:
+                print(f"Skipping record {record_id} - no contract address")
                 continue
 
-            # Process each record
-            for index, record in enumerate(records, 1):
-                record_id = record['id']
-                fields = record.get('fields', {})
-                contract_address = fields.get('address')
+            print(f"Processing {index}/{len(records)}: {contract_address}")
 
-                if not contract_address:
-                    print(f"Skipping record {record_id} - no contract address")
-                    continue
+            # Search GitHub
+            repos_data = GitHubAPI.search_contract(contract_address)
 
-                print(f"Processing {index}/{len(records)}: {contract_address}")
+            # Update Airtable
+            AirtableAPI.update_record(record_id, contract_address, repos_data)
 
-                # Search GitHub
-                repos_data = GitHubAPI.search_contract(contract_address)
+            # Rate limiting delay
+            time.sleep(2)
 
-                # Update Airtable
-                AirtableAPI.update_record(record_id, contract_address, repos_data)
-
-                # Rate limiting delay
-                time.sleep(2)
-
-            print(f"Completed processing {origin_key}")
-
-        print("\nFinished processing all origin keys")
+        print(f"Completed processing {origin_key}")
 
     except Exception as e:
         print(f"Error in main process: {str(e)}")
@@ -267,8 +258,13 @@ def main():
         if not all([AIRTABLE_TOKEN, GITHUB_TOKEN]):
             raise EnvironmentError("Missing required environment variables")
 
-        # Run the main process
-        process_contracts()
+        # Set up argument parsing
+        parser = argparse.ArgumentParser(description="Process contracts for a specific origin_key.")
+        parser.add_argument('--origin_key', type=str, required=True, help="The origin_key to process")
+        args = parser.parse_args()
+
+        # Run the main process with the specified origin_key
+        process_contracts(args.origin_key)
 
     except Exception as e:
         print(f"Script failed: {str(e)}")
