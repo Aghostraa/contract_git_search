@@ -18,7 +18,7 @@ load_dotenv()
 # -------------------------------
 
 # Airtable configuration
-AIRTABLE_TOKEN = os.getenv('REACT_APP_AIRTABLE_TOKEN')
+AIRTABLE_TOKEN = os.getenv('AIRTABLE_TOKEN')
 AIRTABLE_BASE_URL = 'https://api.airtable.com/v0/appZWDvjvDmVnOici'
 TABLE_NAME = 'tblcXnFAf0IEvAQA6'
 
@@ -63,40 +63,61 @@ def sanitize_hex_addresses(text: str, target_address: str) -> str:
     return pattern.sub(replacer, text)
 
 
-def compress_snippet(snippet: str, target_marker: str = "target_SC", max_length: int = 300) -> str:
-    """Smart snippet compression preserving context around markers."""
+def compress_snippet(snippet: str, target_marker: str = "target_SC", max_length: int = 400) -> str:
+    """Enhanced snippet compression preserving more context around markers."""
     if not snippet:
         return ""
 
     lines = snippet.splitlines()
 
-    def find_block_bounds(idx: int) -> tuple[int, int]:
-        start = max(0, idx - 1)
-        end = min(len(lines), idx + 2)
+    def is_code_boundary(line: str) -> bool:
+        """Detect if a line represents a logical code boundary."""
+        boundary_patterns = {
+            'function', 'contract', 'library', 'interface',
+            'constructor', 'modifier', 'event',
+            '}', '};', ');'
+        }
+        stripped = line.strip()
+        return any(stripped.startswith(p) or stripped.endswith(p) for p in boundary_patterns)
 
-        # Extend to include complete function/class definition
-        while start > 0 and lines[start - 1].strip().startswith(('def ', 'class ', 'contract ')):
+    def find_block_bounds(idx: int) -> tuple[int, int]:
+        """Find logical block boundaries around an index."""
+        start = max(0, idx - 2)  # Include more context
+        end = min(len(lines), idx + 3)  # Include more context
+
+        # Extend to complete logical blocks
+        while start > 0:
+            if is_code_boundary(lines[start - 1]):
+                break
             start -= 1
-        while end < len(lines) and lines[end - 1].strip().endswith((':', '{', '(')):
+
+        while end < len(lines):
+            if is_code_boundary(lines[end - 1]):
+                end += 1
+                break
             end += 1
+
         return start, end
 
-    # Find target marker with context
+    # Find target marker with enhanced context
     for idx, line in enumerate(lines):
         if target_marker in line:
             start, end = find_block_bounds(idx)
-            return "\n".join(lines[start:end])
+            block = "\n".join(lines[start:end])
+            if len(block) <= max_length:
+                return block
+            return block[:max_length] + "\n..."
 
-    # Progressive trimming
-    length = 0
-    last_break = 0
+    # Progressive trimming with improved boundary detection
+    total_length = 0
+    last_boundary = 0
 
     for idx, line in enumerate(lines):
-        length += len(line) + 1
-        if not line.strip() or line.strip().endswith(('}', ')', ']')):
-            last_break = idx
-        if length > max_length:
-            break_idx = last_break if last_break > 0 else idx
+        total_length += len(line) + 1
+        if is_code_boundary(line):
+            last_boundary = idx
+        if total_length > max_length:
+            break_idx = last_boundary if last_boundary > 0 else idx
             return "\n".join(lines[:break_idx]) + "\n..."
 
     return snippet
@@ -150,78 +171,150 @@ def deduplicate_snippets(snippets: List[str], min_length: int = 10) -> List[str]
 
 
 def get_ai_metadata(snippets: List[str], repo_paths: List[str], target_address: str) -> Optional[dict]:
-    """Analyzes smart contract code snippets to extract metadata."""
+    """Analyzes smart contract code snippets to extract metadata with improved efficiency."""
     if not ANTHROPIC_API_KEY:
         print("Missing Anthropic API key.")
         return None
 
-    # Process snippets
+    # Enhanced snippet preprocessing
     processed_snippets = []
     for snippet in snippets:
-        if "abi" in snippet.lower():
+        # Skip ABI and other non-relevant content
+        if any(x in snippet.lower() for x in ["abi", "receipt", "logsbloom", "0x0000"]):
             continue
 
-        # Apply transformations
+        # Apply transformations with improved context preservation
         snippet = snippet.replace("Targer_SC", "target_SC")
         snippet = sanitize_hex_addresses(snippet, target_address)
-        snippet = compress_snippet(snippet, max_length=300)
-        processed_snippets.append(snippet)
 
-    # Filter and sort repositories
+        # More aggressive snippet filtering for relevance
+        if len(snippet.strip()) < 50 or snippet.count('\n') < 2:
+            continue
+
+        # Enhanced compression focusing on code context
+        compressed = compress_snippet(snippet, max_length=400)  # Increased length for better context
+        if compressed:
+            processed_snippets.append(compressed)
+
+    # Improved repository filtering
     excluded_repos = {
         "0xtorch/datasource",
         "KeystoneHQ/Smart-Contract-Metadata-Registry",
-        "tangtj/bsc-contract-database"
+        "tangtj/bsc-contract-database",
+        "fireblocks/recovery",  # Added based on logs
+        "enzymefinance/sdk",  # Added based on logs
+        "MyEtherWallet/ethereum-lists"  # Added based on logs
     }
+
+    # Enhanced repo sorting prioritizing contract-focused repositories
+    def repo_score(repo: str) -> float:
+        score = 0
+        if "contract" in repo.lower():
+            score += 2
+        if "proxy" in repo.lower():
+            score += 1
+        if repo.count('/') < 2:  # Simpler paths likely more relevant
+            score += 0.5
+        return score
+
     sorted_repos = sorted(
         [repo for repo in repo_paths if repo not in excluded_repos],
-        key=lambda x: len(x.split('/'))  # Prioritize shorter paths
-    )[:5]
+        key=lambda x: (repo_score(x), -len(x.split('/')))  # Prioritize by score then path simplicity
+    )[:3]  # Reduced from 5 to 3 most relevant repos
 
-    # Construct analysis prompt
+    # Enhanced prompt engineering
     prompt = (
-        "Analyze these smart contract snippets and repository data for key information:"
-        "Focus areas:"
-        "1. Contract functionality and inheritance patterns"
-        "2. Function signatures and modifiers"
-        "3. Protocol integrations and standards (ERC20, ERC721, etc)"
-        "4. Repository structure and naming patterns"
-        "5. Comments and documentation context"
-        "Return ONLY a JSON object:"
-        "OUTPUT_START"
-        "{"
-        '  "contract_name": "<Name from patterns or functionality>",'
-        '  "associated_entity": "<Project/Organization/Developer>",'
-        '  "usage_category": "<Primary function: Token/DEX/Lending/etc>"'
-        "}"
-        "OUTPUT_END"
-        f"Code Snippets:{chr(10).join(processed_snippets)}"
-        f"Repository Paths:{chr(10).join(sorted_repos)}"
+        "Analyze these Ethereum smart contract snippets and repository data with an advanced focus on repository paths and mapping contexts:\n"
+        "\nKey focus areas:"
+        "\n1. Repository Path Analysis:"
+        "\n   - Examine the tail segments of repository paths for project name patterns."
+        "\n   - Prioritize the owner/project-name structure to identify project associations."
+        "\n   - Focus on the last parts of repository paths for detailed insights."
+        "\n2. Mapping Context Analysis:"
+        "\n   - Identify and analyze address mapping labels, roles, and integration references."
+        "\n   - Look for the purpose and contextual usage of mappings, including third-party mapping patterns."
+        "\n   - Prioritize project references within mapping structures."
+        "\n   - **NOTE:** All provided snippets contain 'target_SC'. Ensure that mappings assigning 'target_SC' (e.g., rswETH: target_SC) are accurately identified."
+        "\n\nReturn ONLY a JSON object with exactly these fields:"
+        "\nOUTPUT_START"
+        "\n{"
+        '\n  "contract_name": "<Functional name based on code patterns>",'
+        '\n  "associated_entity": "<Project/Organization based on repository paths and mapping contexts>",'
+        '\n  "usage_category": "<Token/DEX/Lending/Bridge/Governance/AVS>"'
+        "\n}"
+        "\nOUTPUT_END"
+        f"\nCode Snippets:\n{chr(10).join(processed_snippets)}"
+        f"\nRepository Paths:\n{chr(10).join(sorted_repos)}"
     )
 
     try:
-        # Prepare API call
+        # Optimized API configuration
         payload = {
             "model": "claude-3-haiku-20240307",
-            "max_tokens": 1024,
+            "max_tokens": 512,  # Reduced from 1024 since we only need a small JSON response
             "messages": [{"role": "user", "content": prompt}]
         }
         print("\nAPI Payload:", json.dumps(payload, indent=2))
 
-        # Make API call
+        # API call with improved error handling
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(**payload)
 
-        # Extract JSON from response
+        # Enhanced response parsing
         content = response.content[0].text if isinstance(response.content, list) else response.content
-        start_idx = content.find("OUTPUT_START") + len("OUTPUT_START")
+        start_idx = content.find("OUTPUT_START")
         end_idx = content.find("OUTPUT_END")
 
-        if start_idx == -1 or end_idx == -1:
-            print("Response markers not found")
-            return None
+        if (start_idx == -1 or end_idx == -1):
+            print("Response markers not found - falling back to direct JSON extraction")
+            # Fallback: try to find JSON directly
+            json_start = content.find("{")
+            json_end = content.rfind("}") + 1
+            if json_start != -1 and json_end > json_start:
+                content = content[json_start:json_end]
+            else:
+                print("No valid JSON found in response")
+                return None
 
-        return json.loads(content[start_idx:end_idx].strip())
+        else:
+            content = content[start_idx + len("OUTPUT_START"):end_idx].strip()
+
+        # Normalize and validate response
+        try:
+            result = json.loads(content)
+            required_fields = {"contract_name", "associated_entity", "usage_category"}
+
+            # Validate and process confidence ratings
+            def extract_confidence_and_value(field_value: str) -> tuple[int, str]:
+                try:
+                    # Extract confidence from [X%] format
+                    confidence_start = field_value.find("[")
+                    confidence_end = field_value.find("%]")
+                    if confidence_start != -1 and confidence_end != -1:
+                        confidence = int(field_value[confidence_start + 1:confidence_end])
+                        value = field_value[confidence_end + 2:].strip()
+                        return confidence, value
+                    return 0, field_value  # Default if no confidence found
+                except (ValueError, IndexError):
+                    return 0, field_value  # Default on parsing error
+
+            # Process each field to separate confidence and value
+            processed_result = {}
+            for field in required_fields:
+                if field not in result:
+                    print(f"Missing required field: {field}")
+                    return None
+
+                confidence, value = extract_confidence_and_value(result[field])
+                processed_result[field] = {
+                    "confidence": confidence,
+                    "value": value
+                }
+
+            return processed_result
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing error: {str(e)}")
+            return None
 
     except Exception as e:
         print(f"API Error: {str(e)}")
@@ -289,42 +382,94 @@ class AirtableAPI:
         return all_records
 
     @staticmethod
-    def update_record(record_id: str, contract_address: str, repos_data: List[Dict],
-                      ai_metadata: Optional[Dict] = None, snippets: Optional[List[str]] = None) -> bool:
+    def fetch_contracts_by_day_range(day_ranges: List[int], origin_key: str = None, limit: int = 30) -> Dict[int, List[Dict]]:
         """
-        Update an Airtable record with GitHub search results and (if available) AI analysis metadata.
-        The following fields are updated:
-          - github_found: Boolean indicating if any repositories were found.
-          - repo_count: Number of repositories found.
-          - repo_paths: A newline‑separated list of repository paths.
-          - ai_contract_name: The contract name from AI analysis.
-          - ai_associated_entity: The company/Git org/creator from AI analysis.
-          - ai_usage_category: The usage category (mapped) from AI analysis.
-          - ai_snippets: The unique code snippets analyzed.
+        Fetch contracts grouped by day_range and sorted by txcount.
+        """
+        grouped_records = {day_range: [] for day_range in day_ranges}
+        
+        for day_range in day_ranges:
+            filter_conditions = [
+                f"day_range = {day_range}",
+                "repo_count = ''"
+            ]
+            if origin_key:
+                filter_conditions.append(f"origin_key = '{origin_key}'")
+                
+            filter_formula = f"AND({','.join(filter_conditions)})"
+            base_url = (
+                f"{AIRTABLE_BASE_URL}/{TABLE_NAME}"
+                f"?filterByFormula={urllib.parse.quote(filter_formula)}"
+                f"&fields[]=address&fields[]=origin_key&fields[]=txcount&fields[]=day_range"
+                f"&sort[0][field]=txcount&sort[0][direction]=desc"
+                f"&maxRecords={limit}"
+            )
+            offset = None
+            page = 1
+            while True:
+                try:
+                    url = f"{base_url}&offset={offset}" if offset else base_url
+                    response = requests.get(url, headers=AIRTABLE_HEADERS)
+                    response.raise_for_status()
+                    data = response.json()
+                    records = data.get('records', [])
+                    grouped_records[day_range].extend(records)
+                    print(f"[Day Range {day_range}] Page {page}: Fetched {len(records)} records. Total: {len(grouped_records[day_range])}")
+                    offset = data.get('offset')
+                    if not offset or len(grouped_records[day_range]) >= limit:
+                        break
+                    page += 1
+                    time.sleep(0.2)  # Respect Airtable rate limits
+                except requests.exceptions.RequestException as e:
+                    print(f"Error fetching page {page} for day_range {day_range}: {str(e)}")
+                    break
+            # Ensure we only keep the top `limit` records
+            grouped_records[day_range] = grouped_records[day_range][:limit]
+        return grouped_records
+
+    @staticmethod
+    def update_record(record_id: str, contract_address: str, repos_data: List[Dict],
+                     ai_metadata: Optional[Dict] = None, snippets: Optional[List[str]] = None) -> bool:
+        """
+        Update an Airtable record with GitHub search results and AI analysis metadata.
+        AI fields use long text format with separate confidence fields.
         """
         url = f"{AIRTABLE_BASE_URL}/{TABLE_NAME}/{record_id}"
 
-        # Collect unique repository names from repos_data.
+        # Basic fields
         repo_paths = list({repo['repo_name'] for repo in repos_data})
         request_body = {
             "fields": {
                 "github_found": bool(repos_data),
                 "repo_count": len(repos_data),
-                "repo_paths": '\n'.join(repo_paths) if repo_paths else ''
-            },
-            "typecast": True
+                "repo_paths": ', '.join(repo_paths) if repo_paths else ''
+            }
         }
-        # If AI metadata is available, include the details.
-        if ai_metadata:
-            request_body["fields"].update({
-                "ai_contract_name": ai_metadata.get("contract_name", ""),
-                "ai_associated_entity": ai_metadata.get("associated_entity", ""),
-                "ai_usage_category": ai_metadata.get("usage_category", "")
-            })
-        # Optionally include the unique snippets.
-        if snippets:
-            request_body["fields"]["ai_snippets"] = '\n'.join(snippets)
 
+        # Handle AI metadata with confidence ratings
+        if ai_metadata:
+            for field in ["contract_name", "associated_entity", "usage_category"]:
+                field_data = ai_metadata.get(field, {})
+                if isinstance(field_data, dict):
+                    # Extract value and confidence from new structure
+                    value = str(field_data.get('value', ''))
+                    confidence = field_data.get('confidence', 0)
+                else:
+                    # Fallback for old structure
+                    value = str(field_data)
+                    confidence = 0
+
+                # Update fields using exact Airtable field names
+                request_body["fields"][f"ai_{field}"] = value
+                request_body["fields"][f"ai_{field}_confidence"] = confidence  # This matches your Airtable field name
+
+        # Store snippets if provided
+        if snippets:
+            request_body["fields"]["ai_snippets"] = '\n\n'.join(snippets)
+
+        print(f"Debug - Request Body: {json.dumps(request_body, indent=2)}")  # Debug print
+
+        # Attempt to update with retries
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
@@ -334,7 +479,8 @@ class AirtableAPI:
                 return True
             except requests.exceptions.RequestException as e:
                 print(f"Error updating record {record_id} (Attempt {attempt}/{max_retries}): {str(e)}")
-                time.sleep(2 ** attempt)  # Exponential backoff
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)  # Exponential backoff
         return False
 
 # -------------------------------
@@ -465,7 +611,6 @@ def process_contracts(origin_key: str):
                 else:
                     print("AI analysis failed or returned no metadata.")
 
-            # Update the Airtable record with GitHub and (if available) AI results.
             AirtableAPI.update_record(record_id, contract_address, repos_data,
                                         ai_metadata=ai_metadata, snippets=top_snippets)
             # Short delay to help with rate limiting.
@@ -477,6 +622,60 @@ def process_contracts(origin_key: str):
         print(f"Error in process_contracts: {str(e)}")
         raise
 
+def process_contracts_by_day_range(day_ranges: List[int], origin_key: str = None):
+    """
+    Process contracts grouped by day_range and sorted by txcount.
+    """
+    try:
+        grouped_records = AirtableAPI.fetch_contracts_by_day_range(day_ranges, origin_key)
+        if not grouped_records:
+            print("No records found for the specified day ranges.")
+            return
+
+        # Since grouped_records is a dictionary
+        for day_range in day_ranges:
+            records = grouped_records.get(day_range, [])
+            print(f"Processing day_range {day_range} with {len(records)} records")
+            
+            for index, record in enumerate(records, 1):
+                record_id = record.get('id')
+                fields = record.get('fields', {})
+                contract_address = fields.get('address')
+                if not contract_address:
+                    print(f"Skipping record {record_id} - no contract address found")
+                    continue
+
+                print(f"Processing {index}/{len(records)}: {contract_address}")
+                search_result = GitHubAPI.search_contract(contract_address)
+                repos_data = search_result.get("repos_data", [])
+                snippets = search_result.get("snippets", [])
+
+                repo_paths = list({repo['repo_name'] for repo in repos_data})
+                unique_snippets = snippets
+
+                if unique_snippets:
+                    unique_snippets = sorted(unique_snippets, key=len, reverse=True)
+                    top_snippets = unique_snippets[:TOP_SNIPPETS_COUNT]
+                else:
+                    top_snippets = []
+
+                ai_metadata = None
+                if top_snippets:
+                    ai_metadata = get_ai_metadata(top_snippets, repo_paths, target_address=contract_address)
+                    if ai_metadata:
+                        print(f"AI Metadata: {ai_metadata}")
+                    else:
+                        print("AI analysis failed or returned no metadata.")
+
+                AirtableAPI.update_record(record_id, contract_address, repos_data,
+                                        ai_metadata=ai_metadata, snippets=top_snippets)
+                time.sleep(2)
+
+        print("Completed processing for specified day ranges.")
+
+    except Exception as e:
+        print(f"Error in process_contracts_by_day_range: {str(e)}")
+        raise
 # -------------------------------
 # Main Entry Point
 # -------------------------------
@@ -484,17 +683,21 @@ def process_contracts(origin_key: str):
 def main():
     """Entry point of the script."""
     try:
-        # Check required environment variables.
         if not all([AIRTABLE_TOKEN, GITHUB_TOKEN, ANTHROPIC_API_KEY]):
             raise EnvironmentError("Missing one or more required environment variables.")
 
-        # Parse command-line arguments.
-        parser = argparse.ArgumentParser(description="Process contracts for a specific origin_key.")
-        parser.add_argument('--origin_key', type=str, required=True, help="The origin_key to process")
+        parser = argparse.ArgumentParser(description="Process contracts by day range and/or origin key")
+        group = parser.add_mutually_exclusive_group(required=True)
+        group.add_argument('--origin_key', type=str, help="The origin_key to process")
+        group.add_argument('--day_ranges', type=int, nargs='+', help="The day_ranges to process (e.g., 7 30)")
+        parser.add_argument('--filter_origin', type=str, help="Optional origin_key filter when using day_ranges")
+        
         args = parser.parse_args()
 
-        # Process contracts using the provided origin_key.
-        process_contracts(args.origin_key)
+        if args.origin_key:
+            process_contracts(args.origin_key)
+        else:
+            process_contracts_by_day_range(args.day_ranges, args.filter_origin)
 
     except Exception as e:
         print(f"Script failed: {str(e)}")
