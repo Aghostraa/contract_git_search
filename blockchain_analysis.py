@@ -254,9 +254,29 @@ def get_existing_addresses_and_record_ids_from_airtable(origin_key: str, origin_
 def add_new_record_to_airtable(chain: str, contract: Dict, origin_key_record_id: str) -> bool:
     """
     Add a new record to Airtable and set the 'asap' field to checked.
+    First checks if the contract already exists to avoid duplicates.
     """
+    address = contract['address'].lower()
+    
+    # First check if the contract already exists
+    filter_formula = f"AND(address = '{address}', SEARCH('{origin_key_record_id}', ARRAYJOIN(origin_key)))"
+    encoded_filter = urllib.parse.quote(filter_formula)
+    check_url = f"{AIRTABLE_BASE_URL}/{CONTRACTS_TABLE}?filterByFormula={encoded_filter}"
+    
+    try:
+        response = requests.get(check_url, headers=AIRTABLE_HEADERS, timeout=30)
+        response.raise_for_status()
+        existing_records = response.json().get('records', [])
+        
+        if existing_records:
+            logger.info(f"Contract {address} already exists in Airtable for this chain. Skipping creation.")
+            return False
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error checking for existing contract {address}: {str(e)}")
+        return False
+    
+    # If we get here, the contract doesn't exist, so create it
     url = f"{AIRTABLE_BASE_URL}/{CONTRACTS_TABLE}"
-    address = contract['address']
     
     # Make sure numeric values are proper numbers, not strings
     tx_count = int(contract['tx_count']) if isinstance(contract['tx_count'], str) else contract['tx_count']
@@ -270,7 +290,7 @@ def add_new_record_to_airtable(chain: str, contract: Dict, origin_key_record_id:
             "origin_key": [origin_key_record_id],  # Format as array for linked record
             "asap": True,  # Set the checkmark
             "txcount": tx_count,
-            "gas_fees_eth": gas_fees_eth,
+            "gas_eth": gas_fees_eth,
             "day_range": day_range
         }
     }
@@ -416,7 +436,7 @@ def main():
         chain_added = 0
         
         # Process top contracts
-        processed_addresses = set()  # To avoid processing the same address twice
+        processed_addresses = set()
         for idx, contract in enumerate(analysis['unlabeled_contracts']):
             address = contract['address'].lower()
             
@@ -444,10 +464,16 @@ def main():
                 else:
                     logger.info(f"Skipped updating {address} (already asap or lower priority day_range)")
             else:
+                # Check if we've reached the limit of new contracts
+                if chain_added >= 10:
+                    logger.info(f"Reached limit of 10 new contracts for {chain}. Skipping remaining new contracts.")
+                    continue
+                    
                 # Add new record
                 if add_new_record_to_airtable(chain, contract, origin_key_id):
                     chain_added += 1
                     total_added += 1
+                    logger.info(f"Added new contract {chain_added}/10 for {chain}")
             
             # Add a small delay between requests to avoid rate limiting
             time.sleep(0.1)
